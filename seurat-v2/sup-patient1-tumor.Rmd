@@ -1,0 +1,193 @@
+---
+title: "Sup-patient1-tumor"
+author: "jmzeng1314@163.com"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(message  = F) 
+```
+
+## 引言
+
+这里直接读取作者给定的第一个病人的Gene expression analysis: discovery patient tumor，用的是 10x genomics 3' Chromium expression assay.
+
+Following sequence alignment and filtering, a total of 7431 tumor cells  
+
+主要是比较免疫治疗前后的肿瘤细胞的免疫变化，免疫治疗前有2243 cells ，免疫治疗后是3个时间点，细胞数量多一点，是5188 cells
+
+
+## 载入必要的R包
+
+需要自行下载安装一些必要的R包！ 而且需要注意版本 Seurat 
+
+因为大量学员在中国大陆，通常不建议大家使用下面的R包安装方法，建议是切换镜像后再下载R包。
+
+参考：http://www.bio-info-trainee.com/3727.html
+
+
+
+```{r,eval=FALSE}
+# 下面代码不运行。
+# Enter commands in R (or R studio, if installed)
+# Install the devtools package from Hadley Wickham
+install.packages('devtools')
+# Replace '2.3.0' with your desired version
+devtools::install_version(package = 'Seurat', version = package_version('2.3.0'))
+
+library(Seurat)
+```
+
+加载R包
+
+```{r}
+rm(list = ls()) # clear the environment
+#load all the necessary libraries
+options(warn=-1) # turn off warning message globally
+suppressMessages(library(Seurat))
+
+```
+
+## 读入文章关于第一个病人的tumor表达矩阵
+
+```{r}
+start_time <- Sys.time()
+# 如果觉得这里较慢，可以使用 data.table 包的 fread函数。
+raw_dataTumor <- read.csv('../Output_2018-03-12/GSE117988_raw.expMatrix_Tumor.csv.gz', header = TRUE, row.names = 1)
+end_time <- Sys.time()
+end_time - start_time
+# 通常电脑一分钟可以搞定。
+
+
+dim(raw_dataTumor) # 7,431 cells and 21,861 genes - already filtered
+
+
+dataTumor <- log2(1 + sweep(raw_dataTumor, 2, median(colSums(raw_dataTumor))/colSums(raw_dataTumor), '*')) # Normalization
+cellTypes <- sapply(colnames(dataTumor), function(x) ExtractField(x, 2, '[.]'))
+cellTypes <-ifelse(cellTypes == '1', 'Tumor_Before', 'Tumor_AcquiredResistance')
+table(cellTypes) 
+```
+
+## 表达矩阵的质量控制
+
+简单看看表达矩阵的性质，主要是基因数量，细胞数量;以及每个细胞表达基因的数量，和每个基因在多少个细胞里面表达。
+
+```{r}
+# 可以看到，2万多的基因里面，
+# 绝大部分基因只在七千多细胞的500个不到的表达，比外周血数据好一点。
+fivenum(apply(dataTumor,1,function(x) sum(x>0) ))
+boxplot(apply(dataTumor,1,function(x) sum(x>0) ))
+
+# 可以看到，七千多细胞里面
+# 绝大部分细胞只能检测不到2000个基因，已经算是不错的了
+fivenum(apply(dataTumor,2,function(x) sum(x>0) ))
+hist(apply(dataTumor,2,function(x) sum(x>0) ))
+```
+
+## 然后创建Seurat的对象
+```{r}
+# Create Seurat object
+tumor <- CreateSeuratObject(raw.data = dataTumor, min.cells = 1, min.genes = 0, project = '10x_Tumor') # already normalized
+tumor # 21,861 genes and 7,431 cells
+# 可以看到上面创建Seurat对象的那些参数并没有过滤基因或者细胞。
+
+
+# Add meta.data (nUMI and cellTypes)
+tumor <- AddMetaData(object = tumor, metadata = apply(raw_dataTumor, 2, sum), col.name = 'nUMI_raw')
+tumor <- AddMetaData(object = tumor, metadata = cellTypes, col.name = 'cellTypes')
+
+```
+
+## 一些质控
+
+这里绘图，可以指定分组，前提是这个分组变量存在于meta信息里面，我们创建对象后使用函数添加了 cellTypes 属性，所以可以用来进行可视化。
+
+这里是：'cellTypes'，就是免疫治疗前后。
+
+```{r}
+sce=tumor
+VlnPlot(object = sce, 
+        features.plot = c("nGene", "nUMI"), 
+        group.by = 'cellTypes', nCol = 2)
+GenePlot(object = sce, gene1 = "nUMI", gene2 = "nGene")
+
+```
+
+可以看看高表达量基因是哪些
+
+```{r}
+tail(sort(Matrix::rowSums(sce@raw.data)))
+## 散点图可视化任意两个基因的一些属性（通常是细胞的度量）
+# 这里选取两个基因。
+tmp=names(sort(Matrix::rowSums(sce@raw.data),decreasing = T))
+GenePlot(object = sce, gene1 = tmp[1], gene2 = tmp[2])
+
+# 散点图可视化任意两个细胞的一些属性（通常是基因的度量）
+# 这里选取两个细胞
+CellPlot(sce,sce@cell.names[3],sce@cell.names[4],do.ident = FALSE)
+
+```
+
+## 最后标准聚类可视化
+
+很简单的流程，先ScaleData，再FindVariableGenes，然后根据找到的高变异基因进行RunPCA，再根据PCA结果进行FindClusters即可，最后再RunTSNE后进行可视化。
+
+```{r}
+start_time <- Sys.time()
+# 最耗费时间的步骤在这里。
+tumor <- ScaleData(object = tumor, vars.to.regress = c('nUMI_raw'), model.use = 'linear', use.umi = FALSE)
+
+tumor <- FindVariableGenes(object = tumor, 
+                           mean.function = ExpMean, 
+                           dispersion.function = LogVMR, 
+                           x.low.cutoff = 0.0125, 
+                           x.high.cutoff = 3, 
+                           y.cutoff = 0.5)
+head(tumor@var.genes)
+length(tumor@var.genes)
+
+
+
+tumor <- RunPCA(object = tumor, 
+                pc.genes = tumor@var.genes)
+tumor <- RunTSNE(object = tumor, 
+                 dims.use = 1:10, 
+                 perplexity = 25)
+
+
+TSNEPlot(tumor, group.by = 'cellTypes', colors.use = c('#EF8A62', '#67A9CF'))
+end_time <- Sys.time()
+end_time - start_time
+#  这里文章里面没有运行 FindClusters ，仅仅是使用 cellTypes
+```
+
+## 输出seurat结果后面使用
+
+```{r}
+start_time <- Sys.time()
+save(tumor,file = 'patient1.tumor.output.Rdata')
+end_time <- Sys.time()
+end_time - start_time
+# 这个步骤会输出文件 
+```
+
+
+同样的，也是需要marker基因来把肿瘤细胞进行分类，最后文章效果图是：
+![](../figures/patient1-tumor-treat-before-VS-after.png) 
+
+需要的marker基因也是附件，如下：
+![](../figures/patient1-tumor-markers.png)
+
+
+
+## 显示运行环境
+
+```{r}
+sessionInfo()
+```
+
+
+

@@ -1,0 +1,9 @@
+{
+    "path" : "~/tmp/10X-immune/seurat-v2",
+    "sortOrder" : [
+        {
+            "ascending" : true,
+            "columnIndex" : 2
+        }
+    ]
+}
